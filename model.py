@@ -2,6 +2,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import numpy as np
+import random
+import math
+from pathlib import Path
+from transformers import AutoTokenizer
 
 # --- 1. ARCHITEKTÚRA (Triedy) ---
 
@@ -138,12 +143,14 @@ class Qwen3Model(nn.Module):
         cos, sin = compute_rope_params(head_dim=head_dim, theta_base=cfg["rope_base"], context_length=cfg["context_length"])
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
+        causal_mask = torch.triu(torch.ones(cfg["context_length"], cfg["context_length"], dtype=torch.bool), diagonal=1)
+        self.register_buffer("causal_mask", causal_mask, persistent=False)
         self.cfg = cfg
 
     def forward(self, in_idx):
         x = self.tok_emb(in_idx)
         num_tokens = x.shape[1]
-        mask = torch.triu(torch.ones(num_tokens, num_tokens, device=x.device, dtype=torch.bool), diagonal=1)
+        mask = self.causal_mask[:num_tokens, :num_tokens]
         
         for block in self.trf_blocks:
             x = block(x, mask, self.cos, self.sin)
@@ -153,8 +160,16 @@ class Qwen3Model(nn.Module):
 
 # --- 2. KONFIGURÁCIA (40M) A INICIALIZÁCIA ---
 
+# Tokenizér sa načíta pred configom, aby vocab_size sedel s modelom
+tok = AutoTokenizer.from_pretrained("NousResearch/Llama-2-7b-hf")
+PAD_ID = tok.pad_token_id
+if PAD_ID is None:
+    tok.pad_token = tok.eos_token
+    PAD_ID = tok.eos_token_id
+print(f"tokenizér: vocab={tok.vocab_size}, pad_id={PAD_ID}, eos_id={tok.eos_token_id}")
+
 QWEN3_CONFIG_40M = {
-    "vocab_size": 151_936,
+    "vocab_size": tok.vocab_size,  # Llama2 SentencePiece = 32 000
     "context_length": 1024,
     "emb_dim": 128,
     "n_heads": 4,
@@ -169,33 +184,138 @@ QWEN3_CONFIG_40M = {
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 torch.manual_seed(123)
-model = Qwen3Model(QWEN3_CONFIG_40M).to(device)
 
-# --- 3. TRÉNINGOVÁ SLUČKA ---
+# --- 2b. DÁTA ---
+
+# Načítanie oboch datasetov (1 string = 1 celý článok alebo 1 Q&A pár)
+text_train = np.load("text_dataset.npz", allow_pickle=True)["train"]
+qa_train = np.load("qa_dataset.npz", allow_pickle=True)["train"]
+text_val = np.load("text_dataset.npz", allow_pickle=True)["val"]
+qa_val = np.load("qa_dataset.npz", allow_pickle=True)["val"]
+print(f"text: train={len(text_train)} val={len(text_val)} | "
+      f"QA: train={len(qa_train)} val={len(qa_val)}")
+
+model = Qwen3Model(QWEN3_CONFIG_40M).to(device)
+print(f"model: {sum(p.numel() for p in model.parameters())/1e6:.1f}M params")
+
+# --- 2c. TOKENIZAČNÉ HELPERY ---
+
+
+def tok_text(s, L):
+    """Text: labels = input_ids (tréning na všetkých tokenoch)."""
+    ids = tok(s, add_special_tokens=False).input_ids[:L]
+    return ids, ids[:]
+
+
+def tok_qa(s, L):
+    """Q&A: prefix 'Question: ...\\nAnswer: ' má labels = -100 (mask),
+    loss sa počíta len na odpovedi za 'Answer: '."""
+    sep = s.find("Answer: ") + len("Answer: ")
+    pre = tok(s[:sep], add_special_tokens=False).input_ids
+    ids = tok(s, add_special_tokens=False).input_ids[:L]
+    labels = [-100] * len(pre) + ids[len(pre):]
+    labels = (labels + [-100] * L)[:L]
+    return ids, labels
+
+
+def sample_batch(src, fn, B, L):
+    """Náhodný batch s pravým paddingom (dáta na začiatku, PAD na konci).
+    Optimálne pre tréning: model nevidí padding tokeny v strede sekvencie."""
+    x = torch.full((B, L), PAD_ID, dtype=torch.long)
+    y = torch.full((B, L), -100, dtype=torch.long)
+    for i in range(B):
+        s = src[i] if isinstance(src, np.ndarray) else random.choice(src)
+        ids, lbls = fn(str(s), L)
+        x[i, :len(ids)] = torch.tensor(ids, dtype=torch.long)
+        y[i, :len(lbls)] = torch.tensor(lbls, dtype=torch.long)
+    return x.to(device), y.to(device)
+
+# --- 3. TRÉNINGOVÁ SLUČKA (gradient accumulation) ---
 
 optimizer = optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.1)
-criterion = nn.CrossEntropyLoss()
-
 model.train()
+
 batch_size = 8
-seq_len = 512 
+seq_len = 512
+accumulation_steps = 4
+num_epochs = 3
 
-for step in range(100):
-    # Dummy dáta
-    input_ids = torch.randint(0, QWEN3_CONFIG_40M["vocab_size"], (batch_size, seq_len), device=device)
-    targets = torch.randint(0, QWEN3_CONFIG_40M["vocab_size"], (batch_size, seq_len), device=device)
 
-    # Forward
-    logits = model(input_ids)
-    loss = criterion(logits.view(-1, QWEN3_CONFIG_40M["vocab_size"]), targets.view(-1))
+def compute_num_steps(text_train, qa_train, batch_size, accumulation_steps, num_epochs):
+    """Výpočet počtu stepov: 1 step = 1 text batch + 1 QA batch (oba s accumulation_steps)."""
+    text_n_batches = (len(text_train) + batch_size - 1) // batch_size
+    qa_n_batches = (len(qa_train) + batch_size - 1) // batch_size
+    batches_per_epoch = text_n_batches + qa_n_batches
+    steps_per_epoch = (batches_per_epoch + accumulation_steps - 1) // accumulation_steps
+    return steps_per_epoch * num_epochs, {
+        "text_batches": text_n_batches,
+        "qa_batches": qa_n_batches,
+        "batches_per_epoch": batches_per_epoch,
+        "steps_per_epoch": steps_per_epoch,
+    }
 
-    # Backward
+
+def train_step(text_train, qa_train, text_val, qa_val, batch_size, seq_len, accumulation_steps):
+    """1 tréningový step: accumulation_steps s processes (text + QA), gradient clip, optimizer step.
+    Vráti (train_loss, val_loss, val_ppl) alebo None ak nie je eval bod."""
     optimizer.zero_grad()
-    loss.backward()
+    total_loss = 0.0
+    num_batches = 0
+
+    for _ in range(accumulation_steps):
+        # 1 text batch
+        xb, yb = sample_batch(text_train, tok_text, batch_size, seq_len)
+        logits = model(xb)
+        loss = F.cross_entropy(logits.view(-1, QWEN3_CONFIG_40M["vocab_size"]),
+                               yb.view(-1), ignore_index=-100)
+        (loss / accumulation_steps).backward()
+        total_loss += loss.item()
+        num_batches += 1
+
+        # 1 QA batch
+        xb, yb = sample_batch(qa_train, tok_qa, batch_size, seq_len)
+        logits = model(xb)
+        loss = F.cross_entropy(logits.view(-1, QWEN3_CONFIG_40M["vocab_size"]),
+                               yb.view(-1), ignore_index=-100)
+        (loss / accumulation_steps).backward()
+        total_loss += loss.item()
+        num_batches += 1
+
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     optimizer.step()
+    return total_loss / num_batches
+
+
+def evaluate(text_val, qa_val, batch_size, seq_len):
+    """Eval pass cez 1 batch z každého val datasetu (bez gradientu)."""
+    model.eval()
+    val_loss_sum, val_batches = 0.0, 0
+    with torch.no_grad():
+        for src, fn in [(text_val, tok_text), (qa_val, tok_qa)]:
+            xb, yb = sample_batch(src, fn, batch_size, seq_len)
+            logits = model(xb)
+            loss = F.cross_entropy(logits.view(-1, QWEN3_CONFIG_40M["vocab_size"]),
+                                   yb.view(-1), ignore_index=-100)
+            val_loss_sum += loss.item()
+            val_batches += 1
+    model.train()
+    return val_loss_sum / val_batches
+
+
+# Výpočet počtu stepov pre N epoch cez celý tréningový set
+num_steps, info = compute_num_steps(text_train, qa_train, batch_size,
+                                    accumulation_steps, num_epochs)
+print(f"text batches: {info['text_batches']} | QA batches: {info['qa_batches']} "
+      f"| batches/epoch: {info['batches_per_epoch']}")
+print(f"steps/epoch: {info['steps_per_epoch']} | total steps ({num_epochs} epoch): {num_steps}")
+
+for step in range(num_steps):
+    train_loss = train_step(text_train, qa_train, text_val, qa_val,
+                            batch_size, seq_len, accumulation_steps)
 
     if step % 10 == 0:
-        print(f"Step {step} | Loss: {loss.item():.4f}")
+        val_loss = evaluate(text_val, qa_val, batch_size, seq_len)
+        print(f"Step {step:3d} | train loss={train_loss:.4f} ppl={math.exp(train_loss):.2f} "
+              f"| val loss={val_loss:.4f} ppl={math.exp(val_loss):.2f}")
 
 print("Tréning dokončený.")
