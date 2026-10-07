@@ -9,7 +9,23 @@ import math
 from pathlib import Path
 from transformers import AutoTokenizer
 
-# --- 1. ARCHITEKTÚRA (Triedy) ---
+# --- 0. KONFIGURÁCIA MODELU ---
+
+QWEN3_CONFIG = {
+    "vocab_size": 32000,
+    "context_length": 1024,
+    "emb_dim": 576,
+    "n_heads": 9,
+    "n_layers": 9,
+    "hidden_dim": 1536,
+    "head_dim": 64,
+    "qk_norm": True,
+    "n_kv_groups": 3,
+    "rope_base": 10_000.0,
+    "dtype": torch.bfloat16,
+}
+
+# --- 1. ARCHITEKTÚRA ---
 
 class FeedForward(nn.Module):
     def __init__(self, cfg):
@@ -23,7 +39,6 @@ class FeedForward(nn.Module):
         x_fc2 = self.fc2(x)
         x = F.silu(x_fc1) * x_fc2
         return self.fc3(x)
-
 
 class RMSNorm(nn.Module):
     def __init__(self, emb_dim, eps=1e-6, bias=False, qwen3_compatible=True):
@@ -44,14 +59,12 @@ class RMSNorm(nn.Module):
             norm_x = norm_x + self.shift
         return norm_x.to(input_dtype)
 
-
 def compute_rope_params(head_dim, theta_base=10_000, context_length=4096, dtype=torch.float32):
     inv_freq = 1.0 / (theta_base ** (torch.arange(0, head_dim, 2, dtype=dtype)[: (head_dim // 2)].float() / head_dim))
     positions = torch.arange(context_length, dtype=dtype)
     angles = positions.unsqueeze(1) * inv_freq.unsqueeze(0)
     angles = torch.cat([angles, angles], dim=1)
     return torch.cos(angles), torch.sin(angles)
-
 
 def apply_rope(x, cos, sin):
     batch_size, num_heads, seq_len, head_dim = x.shape
@@ -62,7 +75,6 @@ def apply_rope(x, cos, sin):
     rotated = torch.cat((-x2, x1), dim=-1)
     x_rotated = (x * cos) + (rotated * sin)
     return x_rotated.to(dtype=x.dtype)
-
 
 class GroupedQueryAttention(nn.Module):
     def __init__(self, d_in, num_heads, num_kv_groups, head_dim=None, qk_norm=False, dtype=None):
@@ -113,7 +125,6 @@ class GroupedQueryAttention(nn.Module):
         context = (attn_weights @ values).transpose(1, 2).reshape(b, num_tokens, self.d_out)
         return self.out_proj(context)
 
-
 class TransformerBlock(nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -137,10 +148,10 @@ class TransformerBlock(nn.Module):
         x = x + shortcut
         return x
 
-
 class Qwen3Model(nn.Module):
     def __init__(self, cfg):
         super().__init__()
+        self.cfg = cfg
         self.tok_emb = nn.Embedding(cfg["vocab_size"], cfg["emb_dim"], dtype=cfg["dtype"])
         self.trf_blocks = nn.ModuleList([TransformerBlock(cfg) for _ in range(cfg["n_layers"])])
         self.final_norm = RMSNorm(cfg["emb_dim"])
@@ -152,89 +163,51 @@ class Qwen3Model(nn.Module):
         self.register_buffer("sin", sin, persistent=False)
         causal_mask = torch.triu(torch.ones(cfg["context_length"], cfg["context_length"], dtype=torch.bool), diagonal=1)
         self.register_buffer("causal_mask", causal_mask, persistent=False)
-        self.cfg = cfg
-        self.out_head.weight = self.tok_emb.weight  # weight tying
+        self.out_head.weight = self.tok_emb.weight
 
     def forward(self, in_idx):
         x = self.tok_emb(in_idx)
         num_tokens = x.shape[1]
+        
+        # OCHRANA: Výnimka pri pretečení kontextového okna
+        if num_tokens > self.cfg["context_length"]:
+            raise ValueError(f"Počet tokenov ({num_tokens}) presahuje kontext ({self.cfg['context_length']})!")
+            
         mask = self.causal_mask[:num_tokens, :num_tokens]
         for block in self.trf_blocks:
             x = block(x, mask, self.cos, self.sin)
         x = self.final_norm(x)
         return self.out_head(x.to(self.cfg["dtype"]))
 
-
-# --- 2. KONFIGURÁCIA ---
-
-tok = AutoTokenizer.from_pretrained("NousResearch/Llama-2-7b-hf")
-PAD_ID = tok.pad_token_id
-if PAD_ID is None:
-    tok.pad_token = tok.eos_token
-    PAD_ID = tok.eos_token_id
-print(f"tokenizér: vocab={tok.vocab_size}, pad_id={PAD_ID}, eos_id={tok.eos_token_id}")
-
-EMB_DIM_FROM_COMPRESSED = 576
-DATASET_PATH = "gneissweb.npz"
-
-QWEN3_CONFIG_50M = {
-    "vocab_size": 32000,
-    "context_length": 1024,
-    "emb_dim": 576,
-    "n_heads": 9,
-    "n_layers": 9,
-    "hidden_dim": 1536,
-    "head_dim": 64,
-    "qk_norm": True,
-    "n_kv_groups": 3,
-    "rope_base": 10_000.0,
-    "dtype": torch.bfloat16,
-}
+# --- 2. TRÉNINGOVÉ PREMENNÉ A FUNKCIE ---
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 torch.manual_seed(123)
 
+PEAK_LR = 6e-4
+MIN_LR = 3e-5
+WARMUP_STEPS = 100
+batch_size = 8
+seq_len = 1024
+accumulation_steps = 4
+num_epochs = 3
+CKPT_EVERY = 500
 
-# --- 2b. DÁTA ---
+# Globálne premenné (naplnia sa iba pri spustení)
+tok = None
+PAD_ID = None
+data = None
+train_tokens = None
+val_tokens = None
+n_train_tokens = 0
+n_val_tokens = 0
+model = None
+optimizer = None
+num_steps = 0
 
-data = np.load(DATASET_PATH)
-train_tokens = data["train"].astype(np.int64)
-val_tokens = data["val"].astype(np.int64)
-n_train_tokens = len(train_tokens)
-n_val_tokens = len(val_tokens)
-print(f"tokens: train={n_train_tokens} ({n_train_tokens // 1024} seq) "
-      f"val={n_val_tokens} ({n_val_tokens // 1024} seq)")
-
-model = Qwen3Model(QWEN3_CONFIG_50M).to(device)
-
-# Načítanie komprimovaných embeddingov (povinné)
-emb_path = Path(f"llama2_compressed_emb_{EMB_DIM_FROM_COMPRESSED}d.pt")
-if not emb_path.exists():
-    print(f"CHYBA: komprimované embeddingy nenájdené: {emb_path}", file=sys.stderr)
-    sys.exit(1)
-compressed = torch.load(emb_path, weights_only=True)
-print(f"komprimované embeddingy: tvar={tuple(compressed.shape)} z {emb_path}")
-if compressed.shape != (QWEN3_CONFIG_50M["vocab_size"], QWEN3_CONFIG_50M["emb_dim"]):
-    print(f"CHYBA: tvar matice nesedí s configom", file=sys.stderr)
-    sys.exit(1)
-with torch.no_grad():
-    model.tok_emb.weight.copy_(compressed.to(model.tok_emb.weight.dtype))
-    model.out_head.weight = model.tok_emb.weight
-print(f"tok_emb inicializovaný z komprimovanej matice")
-print(f"model: {sum(p.numel() for p in model.parameters())/1e6:.1f}M params")
-
-
-# --- 2c. EPOCH-BASED SAMPLER ---
-
-_sampler_state = {}  # id(src) -> {"indices": ndarray, "epoch": int}
-
+_sampler_state = {}
 
 def sample_batch(src, B, L, global_pos):
-    """Vráti batch B sekvencií dĺžky L z flat streamu `src`.
-    
-    global_pos: poradové číslo batchu v rámci zdroja (0, 1, 2, ...).
-      Každá epocha spotrebuje seqs_per_epoch batchov.
-    """
     state = _sampler_state.setdefault(id(src), {"indices": None, "epoch": -1})
     n_tokens = len(src)
     seqs_per_epoch = n_tokens // L
@@ -254,22 +227,6 @@ def sample_batch(src, B, L, global_pos):
     return (torch.from_numpy(x.astype(np.int64)).to(device),
             torch.from_numpy(y.astype(np.int64)).to(device))
 
-
-# --- 3. TRÉNING ---
-
-PEAK_LR = 6e-4
-MIN_LR = 3e-5
-WARMUP_STEPS = 100
-
-batch_size = 8
-seq_len = 1024
-accumulation_steps = 4
-num_epochs = 3
-
-optimizer = optim.AdamW(model.parameters(), lr=PEAK_LR, weight_decay=0.1)
-model.train()
-
-
 def compute_num_steps(n_tokens, batch_size, accumulation_steps, num_epochs):
     seqs_per_epoch = n_tokens // seq_len
     steps_per_epoch = seqs_per_epoch // (batch_size * accumulation_steps)
@@ -277,11 +234,6 @@ def compute_num_steps(n_tokens, batch_size, accumulation_steps, num_epochs):
         "seqs_per_epoch": seqs_per_epoch,
         "steps_per_epoch": steps_per_epoch,
     }
-
-
-num_steps, info = compute_num_steps(n_train_tokens, batch_size,
-                                    accumulation_steps, num_epochs)
-
 
 def get_lr(step):
     if step < WARMUP_STEPS:
@@ -291,22 +243,19 @@ def get_lr(step):
     cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
     return MIN_LR + (PEAK_LR - MIN_LR) * cosine
 
-
 def train_step(step):
-    """1 optimizer krok = accumulation_steps × batch_size sekvencií."""
     lr = get_lr(step)
     for pg in optimizer.param_groups:
         pg["lr"] = lr
 
     optimizer.zero_grad()
     total_loss = 0.0
-    base_pos = step * accumulation_steps  # globálna pozícia prvého batchu v kroku
+    base_pos = step * accumulation_steps
 
     for acc_idx in range(accumulation_steps):
         xb, yb = sample_batch(train_tokens, batch_size, seq_len, base_pos + acc_idx)
         logits = model(xb)
-        loss = F.cross_entropy(logits.view(-1, QWEN3_CONFIG_50M["vocab_size"]),
-                               yb.view(-1))
+        loss = F.cross_entropy(logits.view(-1, QWEN3_CONFIG["vocab_size"]), yb.view(-1))
         (loss / accumulation_steps).backward()
         total_loss += loss.item()
 
@@ -314,122 +263,88 @@ def train_step(step):
     optimizer.step()
     return total_loss / accumulation_steps, lr
 
-
 def evaluate():
-    """Val loss na náhodnom batchi z validačného setu."""
     model.eval()
     with torch.no_grad():
-        # Vypočítame celkový počet dostupných batchov vo validačnom sete
         max_val_step = max(1, (n_val_tokens // seq_len) // batch_size)
-        
-        # Vygenerujeme náhodný index (krok) pre validáciu
         random_val_step = torch.randint(0, max_val_step, (1,)).item()
-        
-        # Použijeme náhodný krok namiesto fixnej nuly
         xb, yb = sample_batch(val_tokens, batch_size, seq_len, random_val_step)
         logits = model(xb)
-        val_loss = F.cross_entropy(logits.view(-1, QWEN3_CONFIG_50M["vocab_size"]),
-                                   yb.view(-1)).item()
+        val_loss = F.cross_entropy(logits.view(-1, QWEN3_CONFIG["vocab_size"]), yb.view(-1)).item()
     model.train()
     return val_loss
 
 
-# --- 3b. CHECKPOINT DIRS ---
+# --- 3. TRÉNINGOVÁ SLUČKA (Vykoná sa len priamo, nie pri importe) ---
 
-local_ckpt_dir = Path("checkpoints")
-local_ckpt_dir.mkdir(exist_ok=True, parents=True)
+if __name__ == "__main__":
+    print("Načítavam tokenizér a dáta...")
+    tok = AutoTokenizer.from_pretrained("NousResearch/Llama-2-7b-hf")
+    PAD_ID = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
+    
+    DATASET_PATH = "dataset_simple.npz"
+    data = np.load(DATASET_PATH)
+    train_tokens = data["train"].astype(np.int64)
+    val_tokens = data["val"].astype(np.int64)
+    n_train_tokens = len(train_tokens)
+    n_val_tokens = len(val_tokens)
 
-# Drive backup len ak je explicitne zapnutý (env var USE_DRIVE=1)
-drive_ckpt_dir = None
-if os.environ.get("USE_DRIVE", "0") == "1":
-    _drive_root = Path("/content/drive/MyDrive")
-    if _drive_root.exists():
-        drive_ckpt_dir = _drive_root / "checkpoints_50m"
-        try:
-            drive_ckpt_dir.mkdir(parents=True, exist_ok=True)
-            print(f"Drive backup: {drive_ckpt_dir}")
-        except Exception as e:
-            print(f"[warn] Drive nedostupný: {e}")
-            drive_ckpt_dir = None
-    else:
-        print(f"[warn] {_drive_root} neexistuje, Drive backup vypnutý")
+    num_steps, info = compute_num_steps(n_train_tokens, batch_size, accumulation_steps, num_epochs)
 
-if drive_ckpt_dir is None:
-    print(f"Checkpointy: {local_ckpt_dir} (len lokálne)")
+    print("Inicializujem model...")
+    model = Qwen3Model(QWEN3_CONFIG).to(device)
 
-CKPT_EVERY = 500
+    EMB_DIM_FROM_COMPRESSED = 576
+    emb_path = Path(f"llama2_compressed_emb_{EMB_DIM_FROM_COMPRESSED}d.pt")
+    if not emb_path.exists():
+        print(f"CHYBA: komprimované embeddingy nenájdené: {emb_path}", file=sys.stderr)
+        sys.exit(1)
+        
+    compressed = torch.load(emb_path, map_location=device, weights_only=True)
+    if compressed.shape != (QWEN3_CONFIG["vocab_size"], QWEN3_CONFIG["emb_dim"]):
+        print("CHYBA: tvar matice nesedí s configom", file=sys.stderr)
+        sys.exit(1)
 
-
-# --- 3c. TRÉNINGOVÁ SLUČKA ---
-
-print(f"seqs/epoch: {info['seqs_per_epoch']} | steps/epoch: {info['steps_per_epoch']} "
-      f"| total steps ({num_epochs} epoch): {num_steps}")
-
-for step in range(num_steps):
-    train_loss, lr = train_step(step)
-
-    if step % 10 == 0:
-        val_loss = evaluate()
-        print(f"Step {step:4d} | lr={lr:.2e} | "
-              f"train loss={train_loss:.6f} ppl={math.exp(train_loss):.2f} | "
-              f"val loss={val_loss:.6f} ppl={math.exp(val_loss):.2f}")
-
-    # Priebežný checkpoint
-    if step > 0 and step % CKPT_EVERY == 0:
-        save_dict = {
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "cfg": QWEN3_CONFIG_50M,
-            "step": step,
-        }
-        ckpt_path = local_ckpt_dir / f"step_{step}.pt"
-        torch.save(save_dict, ckpt_path)
-        print(f"  >>> Checkpoint: {ckpt_path}")
-        if drive_ckpt_dir is not None:
-            try:
-                torch.save(save_dict, drive_ckpt_dir / f"step_{step}.pt")
-                torch.save(save_dict, drive_ckpt_dir / "latest.pt")
-                print(f"  >>> Drive backup OK")
-            except Exception as e:
-                print(f"  >>> [warn] Drive backup zlyhal: {e}")
-
-
-print("Tréning dokončený.")
-
-# === FINÁLNE ULOŽENIE ===
-save_path = local_ckpt_dir / "quick_run.pt"
-final_dict = {"model": model.state_dict(), "cfg": QWEN3_CONFIG_50M, "step": num_steps}
-torch.save(final_dict, save_path)
-print(f"Uložené: {save_path}")
-if drive_ckpt_dir is not None:
-    try:
-        torch.save(final_dict, drive_ckpt_dir / "quick_run.pt")
-        print(f"Uložené na Drive: {drive_ckpt_dir / 'quick_run.pt'}")
-    except Exception as e:
-        print(f"[warn] Drive save zlyhal: {e}")
-
-
-# === GENEROVANIE VZORIEK ===
-print("\n" + "=" * 60)
-print("VZORKY")
-print("=" * 60)
-
-model.eval()
-prompts = ["The history of", "Animals are", "In mathematics",
-           "The Earth is", "Philosophy is"]
-
-for prompt in prompts:
-    ids = tok(prompt, add_special_tokens=False).input_ids
-    x = torch.tensor([ids], dtype=torch.long, device=device)
     with torch.no_grad():
-        for _ in range(80):
-            logits = model(x)
-            next_logits = logits[0, -1, :] / 0.8
-            probs = F.softmax(next_logits.float(), dim=-1)
-            next_id = torch.multinomial(probs, 1).item()
-            x = torch.cat([x, torch.tensor([[next_id]], device=device)], dim=1)
-            if next_id == tok.eos_token_id:
-                break
-    output = tok.decode(x[0].tolist(), skip_special_tokens=True)
-    print(f"\n--- {prompt!r} ---")
-    print(output[:400])
+        model.tok_emb.weight.copy_(compressed.to(model.tok_emb.weight.dtype))
+        model.out_head.weight = model.tok_emb.weight
+
+    optimizer = optim.AdamW(model.parameters(), lr=PEAK_LR, weight_decay=0.1)
+
+    # Príprava lokálnych checkpointov
+    local_ckpt_dir = Path("checkpoints")
+    local_ckpt_dir.mkdir(exist_ok=True, parents=True)
+
+
+    print(f"tokenizér: vocab={tok.vocab_size}, pad_id={PAD_ID}, eos_id={tok.eos_token_id}")
+    print(f"tokens: train={n_train_tokens} ({n_train_tokens // 1024} seq) val={n_val_tokens} ({n_val_tokens // 1024} seq)")
+    print(f"model: {sum(p.numel() for p in model.parameters())/1e6:.1f}M params")
+    print(f"seqs/epoch: {info['seqs_per_epoch']} | steps/epoch: {info['steps_per_epoch']} | total steps: {num_steps}\n")
+
+    model.train()
+    for step in range(num_steps):
+        train_loss, lr = train_step(step)
+
+        # Výpis tréningu každých 10 krokov
+        if step % 10 == 0:
+            print(f"Step {step:4d} | lr={lr:.2e} | train loss={train_loss:.6f} ppl={math.exp(train_loss):.2f}")
+
+        # Výpis a kontrola val_loss iba každých 100 krokov
+        if step > 0 and step % 100 == 0:
+            val_loss = evaluate()
+            print(f"  >>> VAL: Step {step:4d} | val loss={val_loss:.6f} ppl={math.exp(val_loss):.2f}")
+
+        # Ukladanie
+        if step > 0 and step % CKPT_EVERY == 0:
+            save_dict = {
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "cfg": QWEN3_CONFIG,
+                "step": step,
+            }
+            ckpt_path = local_ckpt_dir / f"step_{step}.pt"
+            torch.save(save_dict, ckpt_path)
+
+    print("\nTréning dokončený.")
+    final_dict = {"model": model.state_dict(), "cfg": QWEN3_CONFIG, "step": num_steps}
+    torch.save(final_dict, local_ckpt_dir / "quick_run.pt")
