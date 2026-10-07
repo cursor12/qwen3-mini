@@ -1,5 +1,6 @@
 import sys
 import os
+import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,13 +15,13 @@ from transformers import AutoTokenizer
 QWEN3_CONFIG = {
     "vocab_size": 32000,
     "context_length": 1024,
-    "emb_dim": 576,
-    "n_heads": 9,
-    "n_layers": 9,
-    "hidden_dim": 1536,
+    "emb_dim": 768,
+    "n_heads": 12,
+    "n_layers": 12,
+    "hidden_dim": 3072,
     "head_dim": 64,
     "qk_norm": True,
-    "n_kv_groups": 3,
+    "n_kv_groups": 4,
     "rope_base": 10_000.0,
     "dtype": torch.bfloat16,
 }
@@ -168,11 +169,10 @@ class Qwen3Model(nn.Module):
     def forward(self, in_idx):
         x = self.tok_emb(in_idx)
         num_tokens = x.shape[1]
-        
-        # OCHRANA: Výnimka pri pretečení kontextového okna
+
         if num_tokens > self.cfg["context_length"]:
             raise ValueError(f"Počet tokenov ({num_tokens}) presahuje kontext ({self.cfg['context_length']})!")
-            
+
         mask = self.causal_mask[:num_tokens, :num_tokens]
         for block in self.trf_blocks:
             x = block(x, mask, self.cos, self.sin)
@@ -191,7 +191,7 @@ batch_size = 8
 seq_len = 1024
 accumulation_steps = 4
 num_epochs = 3
-CKPT_EVERY = 500
+CKPT_EVERY = 2000
 
 # Globálne premenné (naplnia sa iba pri spustení)
 tok = None
@@ -274,15 +274,18 @@ def evaluate():
     model.train()
     return val_loss
 
-
 # --- 3. TRÉNINGOVÁ SLUČKA (Vykoná sa len priamo, nie pri importe) ---
 
 if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--resume", action="store_true", help="Pokračovať z checkpoints/latest.pt")
+    args = ap.parse_args()
+
     print("Načítavam tokenizér a dáta...")
     tok = AutoTokenizer.from_pretrained("NousResearch/Llama-2-7b-hf")
     PAD_ID = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
-    
-    DATASET_PATH = "dataset_simple.npz"
+
+    DATASET_PATH = "data/gneissweb.npz"
     data = np.load(DATASET_PATH)
     train_tokens = data["train"].astype(np.int64)
     val_tokens = data["val"].astype(np.int64)
@@ -294,12 +297,12 @@ if __name__ == "__main__":
     print("Inicializujem model...")
     model = Qwen3Model(QWEN3_CONFIG).to(device)
 
-    EMB_DIM_FROM_COMPRESSED = 576
+    EMB_DIM_FROM_COMPRESSED = 768
     emb_path = Path(f"llama2_compressed_emb_{EMB_DIM_FROM_COMPRESSED}d.pt")
     if not emb_path.exists():
         print(f"CHYBA: komprimované embeddingy nenájdené: {emb_path}", file=sys.stderr)
         sys.exit(1)
-        
+
     compressed = torch.load(emb_path, map_location=device, weights_only=True)
     if compressed.shape != (QWEN3_CONFIG["vocab_size"], QWEN3_CONFIG["emb_dim"]):
         print("CHYBA: tvar matice nesedí s configom", file=sys.stderr)
@@ -315,35 +318,60 @@ if __name__ == "__main__":
     local_ckpt_dir = Path("checkpoints")
     local_ckpt_dir.mkdir(exist_ok=True, parents=True)
 
+    # --- RESUME ---
+    start_step = 0
+    if args.resume:
+        resume_path = local_ckpt_dir / "latest.pt"
+        if resume_path.exists():
+            print(f"Resume z {resume_path}")
+            ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+            model.load_state_dict(ckpt["model"])
+            optimizer.load_state_dict(ckpt["optimizer"])
+            start_step = ckpt["step"] + 1
+            print(f"Pokračujem od kroku {start_step}")
+        else:
+            print(f"VAROVANIE: --resume zadané, ale {resume_path} neexistuje. Začínam od nuly.")
 
     print(f"tokenizér: vocab={tok.vocab_size}, pad_id={PAD_ID}, eos_id={tok.eos_token_id}")
     print(f"tokens: train={n_train_tokens} ({n_train_tokens // 1024} seq) val={n_val_tokens} ({n_val_tokens // 1024} seq)")
     print(f"model: {sum(p.numel() for p in model.parameters())/1e6:.1f}M params")
-    print(f"seqs/epoch: {info['seqs_per_epoch']} | steps/epoch: {info['steps_per_epoch']} | total steps: {num_steps}\n")
+    print(f"seqs/epoch: {info['seqs_per_epoch']} | steps/epoch: {info['steps_per_epoch']} | total steps: {num_steps}")
+    print(f"štart od kroku: {start_step}\n")
 
     model.train()
-    for step in range(num_steps):
-        train_loss, lr = train_step(step)
+    step = start_step
+    try:
+        for step in range(start_step, num_steps):
+            train_loss, lr = train_step(step)
 
-        # Výpis tréningu každých 10 krokov
-        if step % 10 == 0:
-            print(f"Step {step:4d} | lr={lr:.2e} | train loss={train_loss:.6f} ppl={math.exp(train_loss):.2f}")
+            if step % 10 == 0:
+                print(f"Step {step:4d} | lr={lr:.2e} | train loss={train_loss:.6f} ppl={math.exp(train_loss):.2f}")
 
-        # Výpis a kontrola val_loss iba každých 100 krokov
-        if step > 0 and step % 100 == 0:
-            val_loss = evaluate()
-            print(f"  >>> VAL: Step {step:4d} | val loss={val_loss:.6f} ppl={math.exp(val_loss):.2f}")
+            if step > 0 and step % 100 == 0:
+                val_loss = evaluate()
+                print(f"  >>> VAL: Step {step:4d} | val loss={val_loss:.6f} ppl={math.exp(val_loss):.2f}")
 
-        # Ukladanie
-        if step > 0 and step % CKPT_EVERY == 0:
-            save_dict = {
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "cfg": QWEN3_CONFIG,
-                "step": step,
-            }
-            ckpt_path = local_ckpt_dir / f"step_{step}.pt"
-            torch.save(save_dict, ckpt_path)
+            if step > 0 and step % CKPT_EVERY == 0:
+                save_dict = {
+                    "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "cfg": QWEN3_CONFIG,
+                    "step": step,
+                }
+                ckpt_path = local_ckpt_dir / f"step_{step}.pt"
+                torch.save(save_dict, ckpt_path)
+                torch.save(save_dict, local_ckpt_dir / "latest.pt")
+    except KeyboardInterrupt:
+        print("\nPrerušené (Ctrl+C). Ukladám latest.pt...")
+        save_dict = {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "cfg": QWEN3_CONFIG,
+            "step": step,
+        }
+        torch.save(save_dict, local_ckpt_dir / "latest.pt")
+        print(f"Uložené: {local_ckpt_dir / 'latest.pt'}")
+        sys.exit(0)
 
     print("\nTréning dokončený.")
     final_dict = {"model": model.state_dict(), "cfg": QWEN3_CONFIG, "step": num_steps}
