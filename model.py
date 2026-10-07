@@ -41,6 +41,7 @@ class FeedForward(nn.Module):
         x = F.silu(x_fc1) * x_fc2
         return self.fc3(x)
 
+
 class RMSNorm(nn.Module):
     def __init__(self, emb_dim, eps=1e-6, bias=False, qwen3_compatible=True):
         super().__init__()
@@ -60,12 +61,14 @@ class RMSNorm(nn.Module):
             norm_x = norm_x + self.shift
         return norm_x.to(input_dtype)
 
+
 def compute_rope_params(head_dim, theta_base=10_000, context_length=4096, dtype=torch.float32):
     inv_freq = 1.0 / (theta_base ** (torch.arange(0, head_dim, 2, dtype=dtype)[: (head_dim // 2)].float() / head_dim))
     positions = torch.arange(context_length, dtype=dtype)
     angles = positions.unsqueeze(1) * inv_freq.unsqueeze(0)
     angles = torch.cat([angles, angles], dim=1)
     return torch.cos(angles), torch.sin(angles)
+
 
 def apply_rope(x, cos, sin):
     batch_size, num_heads, seq_len, head_dim = x.shape
@@ -76,6 +79,7 @@ def apply_rope(x, cos, sin):
     rotated = torch.cat((-x2, x1), dim=-1)
     x_rotated = (x * cos) + (rotated * sin)
     return x_rotated.to(dtype=x.dtype)
+
 
 class GroupedQueryAttention(nn.Module):
     def __init__(self, d_in, num_heads, num_kv_groups, head_dim=None, qk_norm=False, dtype=None):
@@ -126,6 +130,7 @@ class GroupedQueryAttention(nn.Module):
         context = (attn_weights @ values).transpose(1, 2).reshape(b, num_tokens, self.d_out)
         return self.out_proj(context)
 
+
 class TransformerBlock(nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -148,6 +153,7 @@ class TransformerBlock(nn.Module):
         x = self.ff(x)
         x = x + shortcut
         return x
+
 
 class Qwen3Model(nn.Module):
     def __init__(self, cfg):
@@ -187,9 +193,9 @@ torch.manual_seed(123)
 PEAK_LR = 6e-4
 MIN_LR = 3e-5
 WARMUP_STEPS = 100
-batch_size = 8
+batch_size = 32
 seq_len = 1024
-accumulation_steps = 4
+accumulation_steps = 1
 num_epochs = 3
 CKPT_EVERY = 2000
 
@@ -285,7 +291,7 @@ if __name__ == "__main__":
     tok = AutoTokenizer.from_pretrained("NousResearch/Llama-2-7b-hf")
     PAD_ID = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
 
-    DATASET_PATH = "data/gneissweb.npz"
+    DATASET_PATH = "gneissweb.npz"
     data = np.load(DATASET_PATH)
     train_tokens = data["train"].astype(np.int64)
     val_tokens = data["val"].astype(np.int64)
@@ -332,11 +338,13 @@ if __name__ == "__main__":
         else:
             print(f"VAROVANIE: --resume zadané, ale {resume_path} neexistuje. Začínam od nuly.")
 
+    print(f"Dataset: {DATASET_PATH}")
     print(f"tokenizér: vocab={tok.vocab_size}, pad_id={PAD_ID}, eos_id={tok.eos_token_id}")
     print(f"tokens: train={n_train_tokens} ({n_train_tokens // 1024} seq) val={n_val_tokens} ({n_val_tokens // 1024} seq)")
     print(f"model: {sum(p.numel() for p in model.parameters())/1e6:.1f}M params")
-    print(f"seqs/epoch: {info['seqs_per_epoch']} | steps/epoch: {info['steps_per_epoch']} | total steps: {num_steps}")
-    print(f"štart od kroku: {start_step}\n")
+    print(f"epochs: {num_epochs} | seqs/epoch: {info['seqs_per_epoch']} | steps/epoch: {info['steps_per_epoch']}")
+    print(f"total steps: {num_steps} | štart od kroku: {start_step}")
+    print(f"batch_size: {batch_size} | accumulation_steps: {accumulation_steps} | efektívny batch: {batch_size * accumulation_steps}\n")
 
     model.train()
     step = start_step
