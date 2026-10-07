@@ -1,9 +1,10 @@
+import sys
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
-import random
 import math
 from pathlib import Path
 from transformers import AutoTokenizer
@@ -22,6 +23,7 @@ class FeedForward(nn.Module):
         x_fc2 = self.fc2(x)
         x = F.silu(x_fc1) * x_fc2
         return self.fc3(x)
+
 
 class RMSNorm(nn.Module):
     def __init__(self, emb_dim, eps=1e-6, bias=False, qwen3_compatible=True):
@@ -42,12 +44,14 @@ class RMSNorm(nn.Module):
             norm_x = norm_x + self.shift
         return norm_x.to(input_dtype)
 
+
 def compute_rope_params(head_dim, theta_base=10_000, context_length=4096, dtype=torch.float32):
     inv_freq = 1.0 / (theta_base ** (torch.arange(0, head_dim, 2, dtype=dtype)[: (head_dim // 2)].float() / head_dim))
     positions = torch.arange(context_length, dtype=dtype)
     angles = positions.unsqueeze(1) * inv_freq.unsqueeze(0)
     angles = torch.cat([angles, angles], dim=1)
     return torch.cos(angles), torch.sin(angles)
+
 
 def apply_rope(x, cos, sin):
     batch_size, num_heads, seq_len, head_dim = x.shape
@@ -58,6 +62,7 @@ def apply_rope(x, cos, sin):
     rotated = torch.cat((-x2, x1), dim=-1)
     x_rotated = (x * cos) + (rotated * sin)
     return x_rotated.to(dtype=x.dtype)
+
 
 class GroupedQueryAttention(nn.Module):
     def __init__(self, d_in, num_heads, num_kv_groups, head_dim=None, qk_norm=False, dtype=None):
@@ -108,6 +113,7 @@ class GroupedQueryAttention(nn.Module):
         context = (attn_weights @ values).transpose(1, 2).reshape(b, num_tokens, self.d_out)
         return self.out_proj(context)
 
+
 class TransformerBlock(nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -131,19 +137,14 @@ class TransformerBlock(nn.Module):
         x = x + shortcut
         return x
 
+
 class Qwen3Model(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.tok_emb = nn.Embedding(cfg["vocab_size"], cfg["emb_dim"], dtype=cfg["dtype"])
         self.trf_blocks = nn.ModuleList([TransformerBlock(cfg) for _ in range(cfg["n_layers"])])
         self.final_norm = RMSNorm(cfg["emb_dim"])
-        # Tied embeddings: out_head zdieľa váhy s tok_emb (ušetrí vocab_size * emb_dim parametrov).
-        # self.out_head sa používa v state_dict compatibilite; ak je None, použijeme tok_emb.weight.
-        self.tied_embeddings = cfg.get("tied_embeddings", True)
-        if not self.tied_embeddings:
-            self.out_head = nn.Linear(cfg["emb_dim"], cfg["vocab_size"], bias=False, dtype=cfg["dtype"])
-        else:
-            self.out_head = None
+        self.out_head = nn.Linear(cfg["emb_dim"], cfg["vocab_size"], bias=False, dtype=cfg["dtype"])
 
         head_dim = cfg["head_dim"] if cfg["head_dim"] else cfg["emb_dim"] // cfg["n_heads"]
         cos, sin = compute_rope_params(head_dim=head_dim, theta_base=cfg["rope_base"], context_length=cfg["context_length"])
@@ -152,41 +153,20 @@ class Qwen3Model(nn.Module):
         causal_mask = torch.triu(torch.ones(cfg["context_length"], cfg["context_length"], dtype=torch.bool), diagonal=1)
         self.register_buffer("causal_mask", causal_mask, persistent=False)
         self.cfg = cfg
-
-        # Inicializácia tok_emb z PCA-komprimovaných Llama-2 embeddingov (4096 → emb_dim).
-        # effective.py ich vyrobil cez pca_lowrank + std scaling.
-        emb_relpath = f"./llama2_compressed_emb_{cfg['emb_dim']}d.pt"
-        emb_path = Path(emb_relpath)
-        assert emb_path.exists(), (
-            f"Chýbajú skomprimované Llama-2 embeddingy: {emb_relpath}\n"
-            f"Vyrob ich cez: python effective.py (v adresári s embeddingami)"
-        )
-        pretrained = torch.load(emb_path, map_location="cpu", weights_only=True)
-        assert pretrained.shape == self.tok_emb.weight.shape, (
-            f"tok_emb {tuple(self.tok_emb.weight.shape)} != pretrained {tuple(pretrained.shape)}"
-        )
-        with torch.no_grad():
-            self.tok_emb.weight.copy_(pretrained.to(self.tok_emb.weight.dtype))
-        print(f"  → načítané Llama-2 embeddingy ({cfg['emb_dim']}d): {emb_relpath}")
+        self.out_head.weight = self.tok_emb.weight  # weight tying
 
     def forward(self, in_idx):
         x = self.tok_emb(in_idx)
         num_tokens = x.shape[1]
         mask = self.causal_mask[:num_tokens, :num_tokens]
-
         for block in self.trf_blocks:
             x = block(x, mask, self.cos, self.sin)
-
         x = self.final_norm(x)
-        x = x.to(self.cfg["dtype"])
-        # Tied embeddings: out_head = tok_emb.weight.T (ušetrí vocab_size * emb_dim parametrov)
-        if self.tied_embeddings:
-            return F.linear(x, self.tok_emb.weight)
-        return self.out_head(x)
+        return self.out_head(x.to(self.cfg["dtype"]))
 
-# --- 2. KONFIGURÁCIA (40M) A INICIALIZÁCIA ---
 
-# Tokenizér sa načíta pred configom, aby vocab_size sedel s modelom
+# --- 2. KONFIGURÁCIA ---
+
 tok = AutoTokenizer.from_pretrained("NousResearch/Llama-2-7b-hf")
 PAD_ID = tok.pad_token_id
 if PAD_ID is None:
@@ -194,230 +174,262 @@ if PAD_ID is None:
     PAD_ID = tok.eos_token_id
 print(f"tokenizér: vocab={tok.vocab_size}, pad_id={PAD_ID}, eos_id={tok.eos_token_id}")
 
-QWEN3_CONFIG_40M = {
-    "vocab_size": tok.vocab_size,  # Llama2 SentencePiece = 32 000
+EMB_DIM_FROM_COMPRESSED = 576
+DATASET_PATH = "gneissweb.npz"
+
+QWEN3_CONFIG_50M = {
+    "vocab_size": 32000,
     "context_length": 1024,
-    "emb_dim": 96,        # znížené z 128; head_dim * n_heads = 24 * 4 = 96
-    "n_heads": 4,
-    "n_layers": 4,        # znížené z 6
-    "hidden_dim": 256,    # znížené z 384
-    "head_dim": 24,       # znížené z 32
+    "emb_dim": 576,
+    "n_heads": 9,
+    "n_layers": 9,
+    "hidden_dim": 1536,
+    "head_dim": 64,
     "qk_norm": True,
-    "n_kv_groups": 2,
+    "n_kv_groups": 3,
     "rope_base": 10_000.0,
     "dtype": torch.bfloat16,
 }
 
-if __name__ == "__main__":
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    torch.manual_seed(123)
-
-    # --- 2b. DÁTA ---
-
-    # Načítanie oboch datasetov (1 string = 1 celý článok alebo 1 Q&A pár)
-    text_train = np.load("text_dataset.npz", allow_pickle=True)["train"]
-    qa_train = np.load("qa_dataset.npz", allow_pickle=True)["train"]
-    text_val = np.load("text_dataset.npz", allow_pickle=True)["val"]
-    qa_val = np.load("qa_dataset.npz", allow_pickle=True)["val"]
-    print(f"text: train={len(text_train)} val={len(text_val)} | "
-          f"QA: train={len(qa_train)} val={len(qa_val)}")
-
-    model = Qwen3Model(QWEN3_CONFIG_40M).to(device)
-    print(f"model: {sum(p.numel() for p in model.parameters())/1e6:.1f}M params")
-
-    # --- 2c. TOKENIZAČNÉ HELPERY ---
+device = "cuda" if torch.cuda.is_available() else "cpu"
+torch.manual_seed(123)
 
 
-    def tok_text(s, L):
-        """Text: labels = input_ids (tréning na všetkých tokenoch)."""
-        ids = tok(s, add_special_tokens=False).input_ids[:L]
-        return ids, ids[:]
+# --- 2b. DÁTA ---
+
+data = np.load(DATASET_PATH)
+train_tokens = data["train"].astype(np.int64)
+val_tokens = data["val"].astype(np.int64)
+n_train_tokens = len(train_tokens)
+n_val_tokens = len(val_tokens)
+print(f"tokens: train={n_train_tokens} ({n_train_tokens // 1024} seq) "
+      f"val={n_val_tokens} ({n_val_tokens // 1024} seq)")
+
+model = Qwen3Model(QWEN3_CONFIG_50M).to(device)
+
+# Načítanie komprimovaných embeddingov (povinné)
+emb_path = Path(f"llama2_compressed_emb_{EMB_DIM_FROM_COMPRESSED}d.pt")
+if not emb_path.exists():
+    print(f"CHYBA: komprimované embeddingy nenájdené: {emb_path}", file=sys.stderr)
+    sys.exit(1)
+compressed = torch.load(emb_path, weights_only=True)
+print(f"komprimované embeddingy: tvar={tuple(compressed.shape)} z {emb_path}")
+if compressed.shape != (QWEN3_CONFIG_50M["vocab_size"], QWEN3_CONFIG_50M["emb_dim"]):
+    print(f"CHYBA: tvar matice nesedí s configom", file=sys.stderr)
+    sys.exit(1)
+with torch.no_grad():
+    model.tok_emb.weight.copy_(compressed.to(model.tok_emb.weight.dtype))
+    model.out_head.weight = model.tok_emb.weight
+print(f"tok_emb inicializovaný z komprimovanej matice")
+print(f"model: {sum(p.numel() for p in model.parameters())/1e6:.1f}M params")
 
 
-    def tok_qa(s, L):
-        """Q&A: prefix 'Question: ...\\nAnswer: ' má labels = -100 (mask),
-        loss sa počíta len na odpovedi za 'Answer: '."""
-        sep_str = "Answer: "
-        sep_idx = s.find(sep_str)
-        assert sep_idx != -1, f"tok_qa: chýba '{sep_str}' v {s[:80]!r}"
-        sep = sep_idx + len(sep_str)
-        pre = tok(s[:sep], add_special_tokens=False).input_ids
-        ids = tok(s, add_special_tokens=False).input_ids[:L]
-        labels = [-100] * len(pre) + ids[len(pre):]
-        labels = (labels + [-100] * L)[:L]
-        return ids, labels
+# --- 2c. EPOCH-BASED SAMPLER ---
+
+_sampler_state = {}  # id(src) -> {"indices": ndarray, "epoch": int}
 
 
-    def sample_batch(src, fn, B, L):
-        """Náhodný batch s pravým paddingom (dáta na začiatku, PAD na konci).
-        Optimálne pre tréning: model nevidí padding tokeny v strede sekvencie."""
-        x = torch.full((B, L), PAD_ID, dtype=torch.long)
-        y = torch.full((B, L), -100, dtype=torch.long)
-        for i in range(B):
-            s = src[i] if isinstance(src, np.ndarray) else random.choice(src)
-            ids, lbls = fn(str(s), L)
-            x[i, :len(ids)] = torch.tensor(ids, dtype=torch.long)
-            y[i, :len(lbls)] = torch.tensor(lbls, dtype=torch.long)
-        return x.to(device), y.to(device)
+def sample_batch(src, B, L, global_pos):
+    """Vráti batch B sekvencií dĺžky L z flat streamu `src`.
+    
+    global_pos: poradové číslo batchu v rámci zdroja (0, 1, 2, ...).
+      Každá epocha spotrebuje seqs_per_epoch batchov.
+    """
+    state = _sampler_state.setdefault(id(src), {"indices": None, "epoch": -1})
+    n_tokens = len(src)
+    seqs_per_epoch = n_tokens // L
+    steps_per_epoch = max(1, seqs_per_epoch // B)
 
-    # --- 3. TRÉNINGOVÁ SLUČKA (gradient accumulation) ---
+    epoch = global_pos // steps_per_epoch
+    if epoch != state["epoch"]:
+        state["indices"] = np.random.permutation(seqs_per_epoch)
+        state["epoch"] = epoch
 
-    optimizer = optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.1)
+    local = (global_pos % steps_per_epoch) * B
+    idx = state["indices"][local:local + B]
+    starts = idx * L
+
+    x = np.stack([src[s:s + L] for s in starts])
+    y = np.stack([src[s + 1:s + 1 + L] for s in starts])
+    return (torch.from_numpy(x.astype(np.int64)).to(device),
+            torch.from_numpy(y.astype(np.int64)).to(device))
+
+
+# --- 3. TRÉNING ---
+
+PEAK_LR = 6e-4
+MIN_LR = 3e-5
+WARMUP_STEPS = 100
+
+batch_size = 8
+seq_len = 1024
+accumulation_steps = 4
+num_epochs = 3
+
+optimizer = optim.AdamW(model.parameters(), lr=PEAK_LR, weight_decay=0.1)
+model.train()
+
+
+def compute_num_steps(n_tokens, batch_size, accumulation_steps, num_epochs):
+    seqs_per_epoch = n_tokens // seq_len
+    steps_per_epoch = seqs_per_epoch // (batch_size * accumulation_steps)
+    return steps_per_epoch * num_epochs, {
+        "seqs_per_epoch": seqs_per_epoch,
+        "steps_per_epoch": steps_per_epoch,
+    }
+
+
+num_steps, info = compute_num_steps(n_train_tokens, batch_size,
+                                    accumulation_steps, num_epochs)
+
+
+def get_lr(step):
+    if step < WARMUP_STEPS:
+        return PEAK_LR * math.sqrt((step + 1) / WARMUP_STEPS)
+    progress = (step - WARMUP_STEPS) / max(1, num_steps - WARMUP_STEPS)
+    progress = min(1.0, max(0.0, progress))
+    cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+    return MIN_LR + (PEAK_LR - MIN_LR) * cosine
+
+
+def train_step(step):
+    """1 optimizer krok = accumulation_steps × batch_size sekvencií."""
+    lr = get_lr(step)
+    for pg in optimizer.param_groups:
+        pg["lr"] = lr
+
+    optimizer.zero_grad()
+    total_loss = 0.0
+    base_pos = step * accumulation_steps  # globálna pozícia prvého batchu v kroku
+
+    for acc_idx in range(accumulation_steps):
+        xb, yb = sample_batch(train_tokens, batch_size, seq_len, base_pos + acc_idx)
+        logits = model(xb)
+        loss = F.cross_entropy(logits.view(-1, QWEN3_CONFIG_50M["vocab_size"]),
+                               yb.view(-1))
+        (loss / accumulation_steps).backward()
+        total_loss += loss.item()
+
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    optimizer.step()
+    return total_loss / accumulation_steps, lr
+
+
+def evaluate():
+    """Val loss na náhodnom batchi z validačného setu."""
+    model.eval()
+    with torch.no_grad():
+        # Vypočítame celkový počet dostupných batchov vo validačnom sete
+        max_val_step = max(1, (n_val_tokens // seq_len) // batch_size)
+        
+        # Vygenerujeme náhodný index (krok) pre validáciu
+        random_val_step = torch.randint(0, max_val_step, (1,)).item()
+        
+        # Použijeme náhodný krok namiesto fixnej nuly
+        xb, yb = sample_batch(val_tokens, batch_size, seq_len, random_val_step)
+        logits = model(xb)
+        val_loss = F.cross_entropy(logits.view(-1, QWEN3_CONFIG_50M["vocab_size"]),
+                                   yb.view(-1)).item()
     model.train()
-
-    batch_size = 8
-    seq_len = 1024  # zvýšené z 512; text dáta majú ø 1175 tokenov (predtým sa rezali)
-    accumulation_steps = 4
-    num_epochs = 15  # 5× viac než pôvodných 3 — val_loss stagnovala, dáta sú vyčerpané (358k tokenov)
+    return val_loss
 
 
-    def compute_num_steps(text_train, qa_train, batch_size, accumulation_steps, num_epochs):
-        """Výpočet počtu stepov: 1 step = 1 text batch + 1 QA batch (oba s accumulation_steps)."""
-        text_n_batches = (len(text_train) + batch_size - 1) // batch_size
-        qa_n_batches = (len(qa_train) + batch_size - 1) // batch_size
-        batches_per_epoch = text_n_batches + qa_n_batches
-        steps_per_epoch = (batches_per_epoch + accumulation_steps - 1) // accumulation_steps
-        return steps_per_epoch * num_epochs, {
-            "text_batches": text_n_batches,
-            "qa_batches": qa_n_batches,
-            "batches_per_epoch": batches_per_epoch,
-            "steps_per_epoch": steps_per_epoch,
+# --- 3b. CHECKPOINT DIRS ---
+
+local_ckpt_dir = Path("checkpoints")
+local_ckpt_dir.mkdir(exist_ok=True, parents=True)
+
+# Drive backup len ak je explicitne zapnutý (env var USE_DRIVE=1)
+drive_ckpt_dir = None
+if os.environ.get("USE_DRIVE", "0") == "1":
+    _drive_root = Path("/content/drive/MyDrive")
+    if _drive_root.exists():
+        drive_ckpt_dir = _drive_root / "checkpoints_50m"
+        try:
+            drive_ckpt_dir.mkdir(parents=True, exist_ok=True)
+            print(f"Drive backup: {drive_ckpt_dir}")
+        except Exception as e:
+            print(f"[warn] Drive nedostupný: {e}")
+            drive_ckpt_dir = None
+    else:
+        print(f"[warn] {_drive_root} neexistuje, Drive backup vypnutý")
+
+if drive_ckpt_dir is None:
+    print(f"Checkpointy: {local_ckpt_dir} (len lokálne)")
+
+CKPT_EVERY = 500
+
+
+# --- 3c. TRÉNINGOVÁ SLUČKA ---
+
+print(f"seqs/epoch: {info['seqs_per_epoch']} | steps/epoch: {info['steps_per_epoch']} "
+      f"| total steps ({num_epochs} epoch): {num_steps}")
+
+for step in range(num_steps):
+    train_loss, lr = train_step(step)
+
+    if step % 10 == 0:
+        val_loss = evaluate()
+        print(f"Step {step:4d} | lr={lr:.2e} | "
+              f"train loss={train_loss:.6f} ppl={math.exp(train_loss):.2f} | "
+              f"val loss={val_loss:.6f} ppl={math.exp(val_loss):.2f}")
+
+    # Priebežný checkpoint
+    if step > 0 and step % CKPT_EVERY == 0:
+        save_dict = {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "cfg": QWEN3_CONFIG_50M,
+            "step": step,
         }
+        ckpt_path = local_ckpt_dir / f"step_{step}.pt"
+        torch.save(save_dict, ckpt_path)
+        print(f"  >>> Checkpoint: {ckpt_path}")
+        if drive_ckpt_dir is not None:
+            try:
+                torch.save(save_dict, drive_ckpt_dir / f"step_{step}.pt")
+                torch.save(save_dict, drive_ckpt_dir / "latest.pt")
+                print(f"  >>> Drive backup OK")
+            except Exception as e:
+                print(f"  >>> [warn] Drive backup zlyhal: {e}")
 
 
-    def train_step(text_train, qa_train, text_val, qa_val, batch_size, seq_len, accumulation_steps):
-        """1 tréningový step: accumulation_steps s processes (text + QA), gradient clip, optimizer step.
-        Vráti (train_loss, val_loss, val_ppl) alebo None ak nie je eval bod."""
-        optimizer.zero_grad()
-        total_loss = 0.0
-        num_batches = 0
+print("Tréning dokončený.")
 
-        for _ in range(accumulation_steps):
-            # 1 text batch
-            xb, yb = sample_batch(text_train, tok_text, batch_size, seq_len)
-            logits = model(xb)
-            loss = F.cross_entropy(logits.view(-1, QWEN3_CONFIG_40M["vocab_size"]),
-                                   yb.view(-1), ignore_index=-100)
-            (loss / accumulation_steps).backward()
-            total_loss += loss.item()
-            num_batches += 1
-
-            # 1 QA batch
-            xb, yb = sample_batch(qa_train, tok_qa, batch_size, seq_len)
-            logits = model(xb)
-            loss = F.cross_entropy(logits.view(-1, QWEN3_CONFIG_40M["vocab_size"]),
-                                   yb.view(-1), ignore_index=-100)
-            (loss / accumulation_steps).backward()
-            total_loss += loss.item()
-            num_batches += 1
-
-        if not math.isfinite(total_loss):
-            print(f"  ⚠ NaN/Inf loss na step {step} — skipujem update")
-            optimizer.zero_grad()
-            return total_loss / max(1, num_batches)
-
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-        scheduler.step()
-        return total_loss / num_batches
+# === FINÁLNE ULOŽENIE ===
+save_path = local_ckpt_dir / "quick_run.pt"
+final_dict = {"model": model.state_dict(), "cfg": QWEN3_CONFIG_50M, "step": num_steps}
+torch.save(final_dict, save_path)
+print(f"Uložené: {save_path}")
+if drive_ckpt_dir is not None:
+    try:
+        torch.save(final_dict, drive_ckpt_dir / "quick_run.pt")
+        print(f"Uložené na Drive: {drive_ckpt_dir / 'quick_run.pt'}")
+    except Exception as e:
+        print(f"[warn] Drive save zlyhal: {e}")
 
 
-    def evaluate(text_val, qa_val, batch_size, seq_len):
-        """Eval pass cez celý val set (bez gradientu). Priemeruje loss cez všetky batche."""
-        model.eval()
-        val_loss_sum, val_batches = 0.0, 0
-        with torch.no_grad():
-            for src, fn in [(text_val, tok_text), (qa_val, tok_qa)]:
-                n = len(src)
-                if n == 0:
-                    continue
-                # Prejdi všetky batche; posledný môže byť kratší — nech sample_batch
-                # ošetrí (pading + labels=-100), aby loss nepadla.
-                start = 0
-                while start < n:
-                    end = min(start + batch_size, n)
-                    sub_src = src[start:end]
-                    # Manuálne pre každú vzorku v sub-batchi (sample_batch používa
-                    # celý src, takže tu iterujeme manuálne).
-                    B = end - start
-                    x = torch.full((B, seq_len), PAD_ID, dtype=torch.long, device=device)
-                    y = torch.full((B, seq_len), -100, dtype=torch.long, device=device)
-                    for i, s in enumerate(sub_src):
-                        ids, lbls = fn(str(s), seq_len)
-                        x[i, :len(ids)] = torch.tensor(ids, dtype=torch.long)
-                        y[i, :len(lbls)] = torch.tensor(lbls, dtype=torch.long)
-                    logits = model(x)
-                    loss = F.cross_entropy(logits.view(-1, QWEN3_CONFIG_40M["vocab_size"]),
-                                           y.view(-1), ignore_index=-100)
-                    val_loss_sum += loss.item()
-                    val_batches += 1
-                    start = end
-        model.train()
-        return val_loss_sum / max(1, val_batches)
+# === GENEROVANIE VZORIEK ===
+print("\n" + "=" * 60)
+print("VZORKY")
+print("=" * 60)
 
+model.eval()
+prompts = ["The history of", "Animals are", "In mathematics",
+           "The Earth is", "Philosophy is"]
 
-    # Výpočet počtu stepov pre N epoch cez celý tréningový set
-    num_steps, info = compute_num_steps(text_train, qa_train, batch_size,
-                                        accumulation_steps, num_epochs)
-    print(f"text batches: {info['text_batches']} | QA batches: {info['qa_batches']} "
-          f"| batches/epoch: {info['batches_per_epoch']}")
-    print(f"steps/epoch: {info['steps_per_epoch']} | total steps ({num_epochs} epoch): {num_steps}")
-
-    # LR scheduler: lineárny warmup (5% steps) + cosine decay na 10% peak LR.
-    warmup_ratio = 0.05
-    min_lr_ratio = 0.1
-    warmup_steps = max(1, int(num_steps * warmup_ratio))
-    decay_steps = max(1, num_steps - warmup_steps)
-
-    def lr_lambda(step):
-        if step < warmup_steps:
-            return (step + 1) / max(1, warmup_steps)
-        progress = (step - warmup_steps) / max(1, decay_steps)
-        cosine = 0.5 * (1.0 + math.cos(math.pi * min(1.0, progress)))
-        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
-
-    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-
-    CHECKPOINT_DIR = Path("checkpoints")
-    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-
-
-    def save_checkpoint(epoch, val_loss):
-        """Uloží epoch checkpoint + (ak zlepšenie) aj model_best.pt."""
-        state = {
-            "epoch": epoch,
-            "model_state": model.state_dict(),
-            "optimizer_state": optimizer.state_dict(),
-            "val_loss": val_loss,
-            "config": QWEN3_CONFIG_40M,
-        }
-        path = CHECKPOINT_DIR / f"model_epoch{epoch}.pt"
-        torch.save(state, path)
-        print(f"  → checkpoint uložený: {path}")
-
-        global best_val_loss
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_path = CHECKPOINT_DIR / "model_best.pt"
-            torch.save(state, best_path)
-            print(f"  → nový najlepší val_loss={val_loss:.4f} uložený: {best_path}")
-
-
-    best_val_loss = float("inf")
-    val_loss = float("inf")
-
-    for step in range(num_steps):
-        train_loss = train_step(text_train, qa_train, text_val, qa_val,
-                                batch_size, seq_len, accumulation_steps)
-
-        if step % 10 == 0:
-            val_loss = evaluate(text_val, qa_val, batch_size, seq_len)
-            print(f"Step {step:3d} | train loss={train_loss:.4f} ppl={math.exp(train_loss):.2f} "
-                  f"| val loss={val_loss:.4f} ppl={math.exp(val_loss):.2f}")
-
-        # Ulož model na konci každej epochy (a zároveň update best ak sa zlepší)
-        if (step + 1) % info["steps_per_epoch"] == 0:
-            epoch = (step + 1) // info["steps_per_epoch"]
-            save_checkpoint(epoch, val_loss)
-
-    print(f"Tréning dokončený. Najlepší val_loss={best_val_loss:.4f}")
+for prompt in prompts:
+    ids = tok(prompt, add_special_tokens=False).input_ids
+    x = torch.tensor([ids], dtype=torch.long, device=device)
+    with torch.no_grad():
+        for _ in range(80):
+            logits = model(x)
+            next_logits = logits[0, -1, :] / 0.8
+            probs = F.softmax(next_logits.float(), dim=-1)
+            next_id = torch.multinomial(probs, 1).item()
+            x = torch.cat([x, torch.tensor([[next_id]], device=device)], dim=1)
+            if next_id == tok.eos_token_id:
+                break
+    output = tok.decode(x[0].tolist(), skip_special_tokens=True)
+    print(f"\n--- {prompt!r} ---")
+    print(output[:400])
