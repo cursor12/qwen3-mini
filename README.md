@@ -8,4 +8,6 @@
 
 
 
-      nohup python model.py > model.log 2>&1 &
+      nohup python -u model.py > model.log 2>&1 &
+
+     nohup python -u model.py --resume > model.log 2>&1 &
