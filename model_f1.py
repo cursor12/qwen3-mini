@@ -355,7 +355,7 @@ if __name__ == "__main__":
             if step % 10 == 0:
                 print(f"Step {step:4d} | lr={lr:.2e} | train loss={train_loss:.6f} ppl={math.exp(train_loss):.2f}")
 
-            if step > 0 and step % 100 == 0:
+            if step > 0 and step % 1000 == 0:
                 val_loss = evaluate()
                 print(f"  >>> VAL: Step {step:4d} | val loss={val_loss:.6f} ppl={math.exp(val_loss):.2f}")
 
