@@ -1,5 +1,5 @@
 """
-Samostatný inference skript pre tvoj 50M Qwen/LLaMA model.
+Samostatný inference skript pre 125M Qwen/LLaMA model.
 Obsahuje celú architektúru aj logiku generovania v jednom súbore.
 Použitie: python simple_inference.py "Váš prompt tu"
 """
@@ -167,25 +167,53 @@ class Qwen3Model(nn.Module):
         return self.out_head(x.to(self.cfg["dtype"]))
 
 
-# --- 2. KONFIGURÁCIA 50M MODELU ---
+# --- 2. KONFIGURÁCIA A UTILITY ---
 
-QWEN3_CONFIG_50M = {
+QWEN3_CONFIG_125M = {
     "vocab_size": 32000,
     "context_length": 1024,
-    "emb_dim": 576,
-    "n_heads": 9,
-    "n_layers": 9,
-    "hidden_dim": 1536,
+    "emb_dim": 768,
+    "n_heads": 12,
+    "n_layers": 12,
+    "hidden_dim": 3072,
     "head_dim": 64,
     "qk_norm": True,
-    "n_kv_groups": 3,
+    "n_kv_groups": 4,
     "rope_base": 10_000.0,
     "dtype": torch.bfloat16,
 }
 
-MODEL_PATH = Path("checkpoints/step_38500.pt")  # Alebo napr. checkpoints/step_20000.pt
+MODEL_PATH = Path("phase2_latest.pt")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-REPETITION_PENALTY = 1.2
+
+# Parametre pre generovanie
+MAX_NEW_TOKENS = 100
+TEMPERATURE = 0.3        # Menšie modely potrebujú nižšiu teplotu (0.3 - 0.6)
+REPETITION_PENALTY = 1.05
+TOP_K = 40               # Odreže tokeny okrem 40 najpravdepodobnejších
+TOP_P = 0.9              # Nucleus sampling
+
+def apply_top_k_top_p(logits, top_k=50, top_p=0.9):
+    """Odfiltruje nepravdepodobné tokeny z long-tailu distribúcie."""
+    # Top-K
+    if top_k > 0:
+        top_k_val = torch.topk(logits, top_k)[0][-1]
+        logits[logits < top_k_val] = -float('Inf')
+
+    # Top-P
+    if top_p < 1.0:
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+        cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+        
+        # Posun masky, aby bol aspoň jeden token vždy nad hranicou
+        sorted_indices_to_remove = cumulative_probs > top_p
+        sorted_indices_to_remove[1:] = sorted_indices_to_remove[:-1].clone()
+        sorted_indices_to_remove[0] = False
+        
+        indices_to_remove = sorted_indices[sorted_indices_to_remove]
+        logits[indices_to_remove] = -float('Inf')
+        
+    return logits
 
 
 # --- 3. INFERENCE LOGIKA ---
@@ -194,7 +222,7 @@ def main():
     if len(sys.argv) > 1:
         prompt = sys.argv[1]
     else:
-        prompt = "Albert Einstein was "
+        prompt = "The Mars planet is "
 
     print(f"Prompt: {prompt}\n")
 
@@ -206,7 +234,7 @@ def main():
 
     # Vytvorenie modelu
     print("Načítavam model...")
-    model = Qwen3Model(QWEN3_CONFIG_50M).to(DEVICE)
+    model = Qwen3Model(QWEN3_CONFIG_125M).to(DEVICE)
 
     # Načítanie checkpointu
     if not MODEL_PATH.exists():
@@ -214,7 +242,7 @@ def main():
         sys.exit(1)
 
     try:
-        checkpoint = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=True)
+        checkpoint = torch.load(MODEL_PATH, map_location=DEVICE, weights_only=False)
         state_dict = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
         model.load_state_dict(state_dict)
     except Exception as e:
@@ -224,21 +252,22 @@ def main():
     model.eval()
     print(f"Model pripravený na zariadení: {DEVICE}\n")
 
-    # Tokenizácia promptu
-    input_ids = tok.encode(prompt, add_special_tokens=False)
+    # Tokenizácia promptu (Zmenené add_special_tokens na True pre BOS token <s>)
+    input_ids = tok.encode(prompt, add_special_tokens=True)
     generated = input_ids.copy()
 
     # Generovanie
     print("Generujem text...\n")
-    max_new_tokens = 80
-    temperature = 0.2
 
     with torch.no_grad():
-        for _ in range(max_new_tokens):
+        for _ in range(MAX_NEW_TOKENS):
+            # Poznámka: Tento postup generovania znovu prepočítava celý kontext. 
+            # Pri 125M modeli to nie je veľký problém, pri väčších modeloch sa používa KV Cache.
             curr_input = torch.tensor([generated], dtype=torch.long, device=DEVICE)
             logits = model(curr_input)
 
-            next_logits = logits[0, -1, :] / temperature
+            # Vyberieme logity posledného vygenerovaného slova a aplikujeme teplotu
+            next_logits = logits[0, -1, :] / TEMPERATURE
 
             # Repetition penalty
             for token_id in set(generated):
@@ -247,6 +276,10 @@ def main():
                 else:
                     next_logits[token_id] *= REPETITION_PENALTY
 
+            # Aplikácia Top-K a Top-P filtrovania
+            next_logits = apply_top_k_top_p(next_logits, top_k=TOP_K, top_p=TOP_P)
+
+            # Softmax a výber ďalšieho tokenu
             probs = F.softmax(next_logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1).item()
 
